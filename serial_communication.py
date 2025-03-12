@@ -1,22 +1,22 @@
 import serial
 import time
 
-def ascii_communication_protocol(port: str, command: str):
+def ascii_communication_protocol(port: str, receiver_id: str, command: str):
     ser = serial.Serial(port, baudrate = 9600, timeout=1)
 
     # Flush input to clear any existing data
     ser.reset_input_buffer()
+    formatted_command = f"{receiver_id} {command}"
+    print(f"Sending command: {formatted_command.strip()} to {port}")
 
-    print(f"Sending command: {command.strip()} to {port}")
-
-    ser.write(command.encode('ascii'))
+    ser.write(formatted_command.encode('ascii'))
 
     time.sleep(0.5)
 
     response = ser.read(ser.in_waiting).decode('ascii').strip()
 
     ser.close()
-
+    print(f"Response from TEC controller: {response}")
     return response
     
 def tec_initalisation(receiver_id, port): # Initalises the TEC-Module by eg. disabling PID Control and the sensors
@@ -63,12 +63,19 @@ def tec_initalisation(receiver_id, port): # Initalises the TEC-Module by eg. dis
     ]
     
     for command in commands:
-        formatted_command = f"{receiver_id} {command}"
-        ascii_communication(port, formatted_command)
+        ascii_communication_protocol(port,receiver_id,command)
         
 # Example usage:
 port = "/dev/ttyUSB1"  # Change this based on your setup
-command = "SDI\n"
-
-response = ascii_communication_protocol(port, command)
-print(f"Response from TEC controller: {response}")
+command_spannung = "GV1\n"
+command_strom = "GCU\n"
+command = "SHC 100\n"
+#command = "SCU 0\n"
+receiver_id = "11"
+#tec_initalisation(receiver_id,port)
+response = ascii_communication_protocol(port,receiver_id, command)
+time.sleep(0.01)
+ascii_communication_protocol(port,receiver_id, command_spannung)
+time.sleep(0.01)
+ascii_communication_protocol(port,receiver_id, command_strom)
+# ascii_communication_protocol(port,receiver_id, "GT3\n")
