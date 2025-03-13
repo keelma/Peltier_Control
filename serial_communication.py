@@ -64,8 +64,10 @@ def tec_initalisation(receiver_id, port): # Initalises the TEC-Module by eg. dis
     
     for command in commands:
         ascii_communication_protocol(port,receiver_id,command)
-        
+
+       
 # Example usage:
+
 port = "/dev/ttyUSB0"  # Change this based on your setup
 command_spannung = "GV1\n"
 command_strom = "GCU\n"
@@ -74,7 +76,11 @@ command = "SCU 100\n"
 receiver_id_11 = "11"
 receiver_id_10 = "10"
 #tec_initalisation(receiver_id_10,port)
-response = ascii_communication_protocol(port,receiver_id_10, command)
+
+ascii_communication_protocol(port,receiver_id_10, "SHC 1000\n")
+ascii_communication_protocol(port,receiver_id_10, "SCC 1000\n")
+
+ascii_communication_protocol(port,receiver_id_10, command)
 time.sleep(1)
 ascii_communication_protocol(port,receiver_id_10, command_spannung)
 time.sleep(1)
