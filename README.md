@@ -17,6 +17,10 @@ To ensure that the TEC modules always have the same serial port names, follow th
 ### 1. Create a udev rule
 Run the following command:
 ```bash
+lsusb
+```
+And retrieve the ID information on each TEC Module.Then run:
+```bash
 sudo nano /etc/udev/rules.d/99-tec.rules
 ```
 Then, add the following lines to specify the TEC modules based on their vendor and product IDs:
