@@ -21,8 +21,8 @@ sudo nano /etc/udev/rules.d/99-tec.rules
 ```
 Then, add the following lines to specify the TEC modules based on their vendor and product IDs:
 ```bash
-SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="tec1"
-SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="tec2"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="tec10"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="tec11"
 ```
 
 ### 2. Apply the New udev Rules
