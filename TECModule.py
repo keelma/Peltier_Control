@@ -21,7 +21,7 @@ class TECModule:
         # Automatically initialize the TEC module
         self.tec_initialisation(self.receiver_id, self.port)
 
-    def logging_data(self, port: str, receiver_id: int):
+    def logging_data(self, port: str, receiver_id: int,command: str):
         ser = serial.Serial(port, baudrate=self.baudrate, timeout=self.timeout)
         ser.reset_input_buffer()
 

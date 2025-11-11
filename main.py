@@ -2,7 +2,6 @@ import time
 from datetime import datetime, timezone
 import traceback
 import threading
-import statistics as pstdev
 import numpy as np
 
 from temperature_sensor_reader_rtd import TemperatureSensorReaderRTD
@@ -117,54 +116,62 @@ shared = Shared()
 
 def arm():
     global armed
-    pwm.set_servo_pulsewidth(pwm_pin_cs, 2000)
-    pwm.set_servo_pulsewidth(pwm_pin_hs, 2000)
-    fan_pwm(2000)
-    
+    pwm.set_mode(pwm_pin_cs, pigpio.OUTPUT)
+    pwm.set_mode(pwm_pin_hs, pigpio.OUTPUT)
+    pwm.set_PWM_frequency(pwm_pin_cs, 25000)
+    pwm.set_PWM_frequency(pwm_pin_hs, 25000)
+    pwm.set_PWM_range(pwm_pin_cs, 100)
+    pwm.set_PWM_range(pwm_pin_hs, 100)
+    fan_pwm(100)
+    print("Armed")
     armed = True
-
     return armed
 
 def disarm():
     global armed
-    pwm.set_servo_pulsewidth(pwm_pin_cs, 2000)
-    pwm.set_servo_pulsewidth(pwm_pin_hs, 2000)
-    tec_module.ascii_communication_protocol(port,receiver_id, 0)
-
+    fan_pwm(0)
+    tec_module.ascii_communication_protocol(port, receiver_id, command_10)
+    print("Disarmed")
     armed = False
-
     return armed
 
-def fan_pwm(pwm_value):
-    pwm.set_servo_pulsewidth(pwm_pin_cs, pwm_value)
-    pwm.set_servo_pulsewidth(pwm_pin_hs, pwm_value)
+def fan_pwm(duty_percent):
+    duty = max(0, min(100, int(duty_percent)))
+    pwm.set_PWM_dutycycle(pwm_pin_cs, duty)
+    pwm.set_PWM_dutycycle(pwm_pin_hs, duty)
 
 
-def check_for_stationary(values, std_tol = 0.2, span_tol = 0.2, min_n = 3):
+def check_for_stationary(values, std_tol = 0.3, span_tol = 0.3, min_n = 3):
 
     if values is None or values.shape[1] < min_n:
         print("BINGERBONGER")
         return False
 
-    row_std = np.std(values, axis = 1)
-    row_span = np.ptp(values, axis = 1)
+    mask = np.all((values >= -40) & (values <= 200), axis=1)
+    filtered = values[mask]
+
+    print(filtered)
+
+    row_std = np.std(filtered, axis = 1)
+    row_span = np.ptp(filtered, axis = 1)
 
     print ("I am Checking")
-    if (row_std <= std_tol) or (row_span <= span_tol):
+    if np.all((row_std <= std_tol) | (row_span <= span_tol)):
         print("Stationary")
-
+        return True
     else:
         print("Not stationary")
-
-    return ((row_std <= std_tol) or (row_span <= span_tol))
+        return False
 
 def tec_control():
+    global measurement_interval_sec, start
     
-    arm()
+    if not armed:
+        arm()
 
     if armed:
         last_seen = 0
-        start_time = datetime.time()
+        stationary = False
 
         while not stationary:
             ver, vals = shared.wait_for_new(last_seen, timeout=20)
@@ -173,36 +180,40 @@ def tec_control():
             
             last_seen = ver
             
-            if check_for_stationary(values, std_tol = 0.2, span_tol = 0.2):
+            if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
                 stationary = True
 
         # Starting ramp test
 
-        min_A = 0
+        min_A = 50
         max_A = 50
-        step_size = 10
-        step_duration = 30 # in sec
+        step_size = 30
+        step_duration =  600 # in sec
 
-        cooling_power = list(range(1000, 2001, 100))
+        cooling_power = list(range(100, 49, -10))
 
-        ramp_commands = [(tec_module.ascii_communication_protocol(port,receiver_id, f"SHC {max_A+1}\n")),
-                (tec_module.ascii_communication_protocol(port,receiver_id, f"SCC {max_A+1}\n")),
-                (tec_module.ascii_communication_protocol(port,receiver_id, command_strom)),
-                (tec_module.ascii_communication_protocol(port,receiver_id, "GPW\n")),
-                (tec_module.ascii_communication_protocol(port,receiver_id, command_spannung)),
-                (tec_module.ascii_communication_protocol(port,receiver_id, command_strom))]
+        tec_module.ascii_communication_protocol(port, receiver_id, f"SHC {max_A+1}\n")
+        time.sleep(1)
+        tec_module.ascii_communication_protocol(port, receiver_id, f"SCC {max_A+1}\n")
+        time.sleep(1)
+
+        ramp_commands = [command_spannung,
+                command_strom,
+                "GPW\n"]
 
         for i in range (min_A, max_A+1, step_size):
-            command_strom = f"SCU {i}\n"
+            print(f"Heating Current: {i/100} A")
+            command_strom_set = f"SCU {i}\n"
 
-            fan_pwm(2000)
+            fan_pwm(100)
 
-            for func, args, kwargs in ramp_commands:
-                _, flag = func(*args, *kwargs)
-
-                if not flag:
+            for cmd in ramp_commands:
+                resp = tec_module.ascii_communication_protocol(port, receiver_id, cmd)
+                if isinstance(resp, tuple) and len(resp) >= 2 and not resp[1]:
                     break
-            
+            tec_module.ascii_communication_protocol(port, receiver_id, command_strom_set)
+
+            stationary = False
             while not stationary:
                 ver, vals = shared.wait_for_new(last_seen, timeout=20)
                 if vals is None:
@@ -210,14 +221,16 @@ def tec_control():
                 
                 last_seen = ver
                 
-                if check_for_stationary(values, std_tol = 0.2, span_tol = 0.2):
+                if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
                     stationary = True
             
             measurement_interval_sec = 5
 
-            for elements in reversed(cooling_power):
-                fan_pwm(elements)
+            for duty in cooling_power:
+                fan_pwm(duty)
+                print (f"Fan power: {duty}")
 
+                stationary = False
                 while not stationary:
                     ver, vals = shared.wait_for_new(last_seen, timeout=20)
                     if vals is None:
@@ -225,7 +238,7 @@ def tec_control():
                     
                     last_seen = ver
                     
-                    if check_for_stationary(values, std_tol = 0.2, span_tol = 0.2):
+                    if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
                         stationary = True
                 time.sleep(step_duration)
 
@@ -236,48 +249,45 @@ def tec_control():
 
 def logging():
     global values
-    while start:
-        try:
-            timestamp = datetime.now(timezone.utc)
+    try:
+        while start:
+            try:
+                timestamp = datetime.now(timezone.utc)
 
-            # --- RTD ---
-            system_values = rtd_reader_system.read()
-            control_values = rtd_reader_control.read()
-            rtd_writer_system.write(timestamp, system_values)
-            rtd_writer_control.write(timestamp, control_values)
-            print(f"Temperature logged: {timestamp}")
-            
-            col = np.asarray(system_values, dtype=float)[:, None] 
+                # --- RTD ---
+                system_values = rtd_reader_system.read()
+                control_values = rtd_reader_control.read()
+                rtd_writer_system.write(timestamp, system_values)
+                rtd_writer_control.write(timestamp, control_values)
+                print(f"Temperature logged: {timestamp}")
+                
+                col = np.asarray(system_values, dtype=float)[:, None] 
 
-            if values is None:
-                values = col
-            else:
-                values = np.hstack([values, col])
+                if values is None:
+                    values = col
+                else:
+                    values = np.hstack([values, col])
 
-            if values.shape[1] > 3:
-                values = values[:, 1:]
+                if values.shape[1] > 3:
+                    values = values[:, 1:]
 
-            print (f"Values {values}")
+                #print (f"Values {values}")
 
-            shared.publish(values)
+                shared.publish(values)
 
-            time.sleep(measurement_interval_sec)
+                time.sleep(measurement_interval_sec)
 
-        except KeyboardInterrupt:
-            print("Logging stopped by user.")
-            break
-        except Exception as e:
-            print("Error occured:")
-            traceback.print_exc()
-            print(f"Restarting in {RETRY_WAIT_SECONDS} seconds...\n")
-            time.sleep(RETRY_WAIT_SECONDS)
-
-        finally:
-            rtd_writer_system.close()
-            rtd_writer_control.close()
-
-    tec_control_thread.join()
-    logging_thread.join()
+            except KeyboardInterrupt:
+                print("Logging stopped by user.")
+                break
+            except Exception as e:
+                print("Error occured:")
+                traceback.print_exc()
+                print(f"Restarting in {RETRY_WAIT_SECONDS} seconds...\n")
+                time.sleep(RETRY_WAIT_SECONDS)
+    finally:
+        rtd_writer_system.close()
+        rtd_writer_control.close()
     
 
     
@@ -289,4 +299,7 @@ logging_thread = threading.Thread(target = logging)
 
 tec_control_thread.start()
 logging_thread.start()
+
+tec_control_thread.join()
+logging_thread.join()
 
