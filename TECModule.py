@@ -55,7 +55,7 @@ class TECModule:
         print(f"Sending command: {formatted_command.strip()} to {port}")
 
         ser.write(formatted_command.encode('ascii'))
-        time.sleep(1)
+        time.sleep(0.1)
 
         response = ser.read(ser.in_waiting).decode('ascii').strip()
         ser.close()

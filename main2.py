@@ -3,18 +3,15 @@ from datetime import datetime, timezone
 import traceback
 import threading
 import numpy as np
-import RPi.GPIO as GPIO
 
 from fan_controller import FanController
 
 from temperature_sensor_reader_rtd import TemperatureSensorReaderRTD
 from temperature_sensor_writer_rtd import TemperatureSensorWriterRTD
-
-from electrical_sensor_writer_rtd import ElectronicsWriterRTD
+from temperature_sensor_reader_tc import TemperatureSensorReaderTC
+from temperature_sensor_writer_tc import TemperatureSensorWriterTC
 
 from TECModule import TECModule
-
-import re
 
 
 # ------------------- InfluxDB SETTINGS -------------------
@@ -76,23 +73,6 @@ rtd_writer_control = TemperatureSensorWriterRTD(
     # csv_file_path=CSV_RTD_CONTROL_PATH
 )
 
-start = False
-
-
-# ------------------ FAN CONFIG ---------------------------
-
-tacho_hs = 25
-pwm_hs =  12#12
-
-tacho_cs = 16
-pwm_cs = 13
-
-
-fan_hs = FanController(name="fan_hs", pwm_pin = pwm_hs, pulse_rpm_pin = tacho_hs, target_rpm = 15000)
-fan_cs = FanController(name = "fan_cs", pwm_pin = pwm_cs, pulse_rpm_pin = tacho_cs, target_rpm = 15000)
-fan_hs.start()
-fan_cs.start()
-
 # --------------- TEC MODULE CONFIG -----------------------
 
 port = "/dev/ttyUSB0"
@@ -103,6 +83,28 @@ tec_module = TECModule(port, receiver_id)
 command_spannung = "GV1\n"
 command_strom = "GCU\n"
 command_10 = "SCU 0\n"
+
+# ------------------ FAN CONFIG ---------------------------
+
+import pigpio
+
+pwm_pin_hs = 12
+pwm_pin_cs = 13
+
+tacho_pin_hs = 1
+tacho_pin_cs = 6
+
+fan_hs = FanController("fan_hs", tacho_pin_hs, pwm_pin_hs, 0, pulses_per_rev=2,
+                 Kp=0.00003, Ki=0.0002, Kd=0.000001, update_interval=1)
+
+fan_cs = FanController("fan_cs", tacho_pin_cs, pwm_pin_cs, 0, pulses_per_rev = 2,
+                Kp=0.00003, Ki=0.0002, Kd=0.000001, update_interval=1)
+
+fan_hs.start()
+fan_cs.start()
+
+armed = False
+start = True
 
 # ------------------- FUNCTIONS ---------------------------
 
@@ -127,8 +129,25 @@ class Shared():
 
 shared = Shared()
 
+def arm():
+    global armed
+    fan_hs.set_target_rpm(14000)
+    fan_cs.set_target_rpm(14000)
+    print("Armed")
+    armed = True
+    return armed
 
-def check_for_stationary(values, std_tol = 0.1, span_tol = 0.1, min_n = 3):
+def disarm():
+    global armed
+    fan_hs.set_target_rpm(0)
+    fan_cs.set_target_rpm(0)
+    tec_module.ascii_communication_protocol(port, receiver_id, command_10)
+    print("Disarmed")
+    armed = False
+    return armed
+
+
+def check_for_stationary(values, std_tol = 0.3, span_tol = 0.3, min_n = 3):
 
     if values is None or values.shape[1] < min_n:
         print("BINGERBONGER")
@@ -151,57 +170,15 @@ def check_for_stationary(values, std_tol = 0.1, span_tol = 0.1, min_n = 3):
         return False
 
 def tec_control():
-
-
     global measurement_interval_sec, start
-
-    start = True
     
-    last_seen = 0
-    stationary = False
+    if not armed:
+        arm()
 
-    while not stationary:
-        ver, vals = shared.wait_for_new(last_seen, timeout=20)
-        if vals is None:
-            continue
-        
-        last_seen = ver
-        
-        if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
-            stationary = True
-
-    # Starting ramp test
-
-    min_A = 50
-    max_A = 51
-    step_size = 30
-    step_duration = 120  # in sec
-
-    cooling_power = list(range(15000, 9999, -1000))
-
-    fan_hs.set_target_rpm(15000)
-    fan_cs.set_target_rpm(15000)
-
-    tec_module.ascii_communication_protocol(port, receiver_id, f"SHC {max_A+1}\n")
-    time.sleep(1)
-    tec_module.ascii_communication_protocol(port, receiver_id, f"SCC {max_A+1}\n")
-    time.sleep(1)
-
-    ramp_commands = [command_spannung,
-            command_strom,
-            "GPW\n"]
-
-    for i in range (min_A, max_A+1, step_size):
-        print(f"Heating Current: {i/100} A")
-        command_strom_set = f"SCU {i}\n"
-
-        for cmd in ramp_commands:
-            resp = tec_module.ascii_communication_protocol(port, receiver_id, cmd)
-            if isinstance(resp, tuple) and len(resp) >= 2 and not resp[1]:
-                break
-        tec_module.ascii_communication_protocol(port, receiver_id, command_strom_set)
-
+    if armed:
+        last_seen = 0
         stationary = False
+
         while not stationary:
             ver, vals = shared.wait_for_new(last_seen, timeout=20)
             if vals is None:
@@ -211,13 +188,37 @@ def tec_control():
             
             if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
                 stationary = True
-        
-        measurement_interval_sec = 5
 
-        for rpm in cooling_power:
-            fan_hs.set_target_rpm(rpm)
-            fan_cs.set_target_rpm(rpm)
-            print (f"Target rpm: {rpm}")
+        # Starting ramp test
+
+        min_A = 50
+        max_A = 50
+        step_size = 30
+        step_duration =  600 # in sec
+
+        cooling_power = list(range(100, 49, -10))
+
+        tec_module.ascii_communication_protocol(port, receiver_id, f"SHC {max_A+1}\n")
+        time.sleep(1)
+        tec_module.ascii_communication_protocol(port, receiver_id, f"SCC {max_A+1}\n")
+        time.sleep(1)
+
+        ramp_commands = [command_spannung,
+                command_strom,
+                "GPW\n"]
+
+        for i in range (min_A, max_A+1, step_size):
+            print(f"Heating Current: {i/100} A")
+            command_strom_set = f"SCU {i}\n"
+
+            fan_hs.set_target_rpm(14000)
+            fan_cs.set_target_rpm(14000)
+
+            for cmd in ramp_commands:
+                resp = tec_module.ascii_communication_protocol(port, receiver_id, cmd)
+                if isinstance(resp, tuple) and len(resp) >= 2 and not resp[1]:
+                    break
+            tec_module.ascii_communication_protocol(port, receiver_id, command_strom_set)
 
             stationary = False
             while not stationary:
@@ -227,12 +228,31 @@ def tec_control():
                 
                 last_seen = ver
                 
-                if check_for_stationary(vals):
+                if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
                     stationary = True
-            time.sleep(step_duration)
+            
+            measurement_interval_sec = 5
 
-        measurement_interval_sec = 10
+            for duty in cooling_power:
+                fan_hs.set_target_rpm(duty)
+                fan_cs.set_target_rpm(duty)
+                print (f"Fan power: {duty}")
 
+                stationary = False
+                while not stationary:
+                    ver, vals = shared.wait_for_new(last_seen, timeout=20)
+                    if vals is None:
+                        continue
+                    
+                    last_seen = ver
+                    
+                    if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
+                        stationary = True
+                time.sleep(step_duration)
+
+            measurement_interval_sec = 10
+
+    disarm()
     start = False
 
 def logging():
@@ -240,35 +260,13 @@ def logging():
     try:
         while start:
             try:
-
-                # --- RTD ---
-                current = tec_module.ascii_communication_protocol(port, receiver_id, "GCU\n")
-                current = current[0]
-                current = float(current.split('=')[1].split()[0])
-
-                voltage_plus = tec_module.ascii_communication_protocol(port, receiver_id, "GV1\n")
-                voltage_plus = voltage_plus[0]
-                voltage_plus = float(voltage_plus.split('=')[1].split()[0])
-
-                voltage_minus = tec_module.ascii_communication_protocol(port, receiver_id, "GV2\n")
-                voltage_minus = voltage_minus[0]
-                voltage_minus = float(voltage_minus.split('=')[1].split()[0])
-
-                rpm_fan_hs = fan_hs.get_current_rpm()
-                rpm_fan_cs = fan_cs.get_current_rpm()
-
-                print(f"Current: {current}, Voltage Heating: {voltage_plus}, \n Voltage Cooling: {voltage_minus} RPM Hot Side: {rpm_fan_hs}, RPM Cold Side: {rpm_fan_cs}")
-
                 timestamp = datetime.now(timezone.utc)
 
+                # --- RTD ---
                 system_values = rtd_reader_system.read()
                 control_values = rtd_reader_control.read()
                 rtd_writer_system.write(timestamp, system_values)
                 rtd_writer_control.write(timestamp, control_values)
-                #electrial_logger.write(timestamp, current)
-                #electrical_logger.write(timestamp, voltage)
-                #fan_logger.write(timestamp, rpm_fan_hs)
-                #fan_logger.write(timestamp, rpm_fan_cs)
                 print(f"Temperature logged: {timestamp}")
                 
                 col = np.asarray(system_values, dtype=float)[:, None] 
@@ -296,32 +294,20 @@ def logging():
                 print(f"Restarting in {RETRY_WAIT_SECONDS} seconds...\n")
                 time.sleep(RETRY_WAIT_SECONDS)
     finally:
-        pass
+        rtd_writer_system.close()
+        rtd_writer_control.close()
+    
 
     
 
 # ----------------- START THREADS -------------------------
 
-try:
-    tec_control_thread = threading.Thread(target = tec_control)
-    logging_thread = threading.Thread(target = logging)
+tec_control_thread = threading.Thread(target = tec_control)
+logging_thread = threading.Thread(target = logging)
 
-    tec_control_thread.start()
-    logging_thread.start()
+tec_control_thread.start()
+logging_thread.start()
 
-    tec_control_thread.join()
-    logging_thread.join()
-
-except KeyboardInterrupt:
-    print("Keyboard Interrupt.")
-    pass
-
-finally:
-    rtd_writer_system.close()
-    rtd_writer_control.close()
-    fan_hs.cleanup()
-    fan_cs.cleanup()
-    tec_module.ascii_communication_protocol(port, receiver_id, "SCU 0 \n")
-    GPIO.cleanup()
-
+tec_control_thread.join()
+logging_thread.join()
 
