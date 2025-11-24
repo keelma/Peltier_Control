@@ -10,11 +10,13 @@ from fan_controller import FanController
 from temperature_sensor_reader_rtd import TemperatureSensorReaderRTD
 from temperature_sensor_writer_rtd import TemperatureSensorWriterRTD
 
-from electrical_sensor_writer_rtd import ElectronicsWriterRTD
+from data_logger import SensorDataWriter
 
 from TECModule import TECModule
 
 import re
+
+start = True
 
 
 # ------------------- InfluxDB SETTINGS -------------------
@@ -51,7 +53,7 @@ board_3 = {
 values = None
 
 system_labels = [f"B{i}_CH{j}" for i in range(3) for j in range(1, 9)]  # 24 labels
-control_labels = ["sensor_left_front","sensor_right_front","sensor_left_back","sensor_right_back"]                 # 4 labels
+control_labels = ["sensor_left_front","sensor_right_front","sensor_left_back","sensor_right_back"]  # 4 labels
 
 rtd_reader_system = TemperatureSensorReaderRTD(board_channel_map=boards_0_2)
 rtd_reader_control = TemperatureSensorReaderRTD(board_channel_map=board_3)
@@ -76,20 +78,27 @@ rtd_writer_control = TemperatureSensorWriterRTD(
     # csv_file_path=CSV_RTD_CONTROL_PATH
 )
 
-start = False
+sensor_data_writer = SensorDataWriter(
+    influx_url=INFLUX_URL,
+    token=INFLUX_TOKEN,
+    org=INFLUX_ORG,
+    bucket=INFLUX_BUCKET,
+    sensor_type="system_id",
+    labels=system_labels,
+    # csv_file_path=CSV_RTD_SYSTEM_PATH
+)
 
 
 # ------------------ FAN CONFIG ---------------------------
 
 tacho_hs = 25
-pwm_hs =  12#12
+pwm_hs =  12
 
 tacho_cs = 16
 pwm_cs = 13
 
-
-fan_hs = FanController(name="fan_hs", pwm_pin = pwm_hs, pulse_rpm_pin = tacho_hs, target_rpm = 15000)
-fan_cs = FanController(name = "fan_cs", pwm_pin = pwm_cs, pulse_rpm_pin = tacho_cs, target_rpm = 15000)
+fan_hs = FanController(name="fan_hs", pwm_pin = pwm_hs, pulse_rpm_pin = tacho_hs, target_rpm = 15000, Kp = 3, Kd = 0.0, Ki = 19)
+fan_cs = FanController(name = "fan_cs", pwm_pin = pwm_cs, pulse_rpm_pin = tacho_cs, target_rpm = 15000, Kp = 2.5,Ki = 11.67, Kd = 0.4)
 fan_hs.start()
 fan_cs.start()
 
@@ -104,6 +113,7 @@ command_spannung = "GV1\n"
 command_strom = "GCU\n"
 command_10 = "SCU 0\n"
 
+
 # ------------------- FUNCTIONS ---------------------------
 
 class Shared():
@@ -112,7 +122,18 @@ class Shared():
         self._cond = threading.Condition()
         self._values = None
         self._version = 0
-    
+        self.current_i = 0.0
+        self.min_n = 20
+
+    def set_i(self, val):
+        with self._cond:
+            self.current_i = float(val)
+            self._cond.notify_all()
+
+    def get_i(self):
+        with self._cond:
+            return self.current_i
+
     def publish(self, values):
         with self._cond:
             self._values = values
@@ -120,15 +141,20 @@ class Shared():
             self._cond.notify_all()
 
     def wait_for_new(self, last_seen, timeout = None):
-            with self._cond:
-                if not self._cond.wait_for(lambda: self._version != last_seen, timeout = timeout):
-                    return last_seen, None
-                return self._version, self._values
-
+        with self._cond:
+            if not self._cond.wait_for(lambda: self._version != last_seen, timeout = timeout):
+                return last_seen, None
+            return self._version, self._values
+            
+    def get_min_n(self):
+        return float(self.min_n)
+    
 shared = Shared()
 
 
-def check_for_stationary(values, std_tol = 0.1, span_tol = 0.1, min_n = 3):
+def check_for_stationary(values, std_tol = 0.1, span_tol = 0.1, min_n = 5):
+
+    min_n = shared.get_min_n()
 
     if values is None or values.shape[1] < min_n:
         print("BINGERBONGER")
@@ -136,8 +162,6 @@ def check_for_stationary(values, std_tol = 0.1, span_tol = 0.1, min_n = 3):
 
     mask = np.all((values >= -40) & (values <= 200), axis=1)
     filtered = values[mask]
-
-    print(filtered)
 
     row_std = np.std(filtered, axis = 1)
     row_span = np.ptp(filtered, axis = 1)
@@ -150,13 +174,47 @@ def check_for_stationary(values, std_tol = 0.1, span_tol = 0.1, min_n = 3):
         print("Not stationary")
         return False
 
+
+# ---------------------------------------------------------------------
+# FIX: parse_tec_response rewritten but ALL prints preserved
+# ---------------------------------------------------------------------
+
+def parse_tec_response(resp, label):
+    """
+    Extracts the numeric value from the TEC ASCII response.
+    Expected format: "KEY=VALUE UNIT"
+    Returns float or None if invalid.
+    """
+
+    if not isinstance(resp, tuple) or len(resp) < 2:
+        print(f"Invalid TEC response structure for {label}: {resp}")
+        return None
+
+    text, ok = resp[0], resp[1]
+
+    if not ok or text is None:
+        print(f"TEC returned error for {label}: {resp}")
+        return None
+
+    match = re.search(r"=([\-0-9\.]+)", text)
+    if not match:
+        print(f"Could not parse TEC response for {label}: {text}")
+        return None
+
+    try:
+        return float(match.group(1))
+    except ValueError:
+        print(f"Value parsing failed for {label}: {text}")
+        return None
+
+
+# ---------------- TEC CONTROL THREAD --------------------
+
 def tec_control():
 
+    global measurement_interval_sec
+    global start  # FIX
 
-    global measurement_interval_sec, start
-
-    start = True
-    
     last_seen = 0
     stationary = False
 
@@ -167,17 +225,17 @@ def tec_control():
         
         last_seen = ver
         
-        if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
+        if check_for_stationary(vals, std_tol = 0.1, span_tol = 0.1):
             stationary = True
 
     # Starting ramp test
 
-    min_A = 50
-    max_A = 51
-    step_size = 30
-    step_duration = 120  # in sec
+    min_A = 40
+    max_A = 100
+    step_size = 20
+    step_duration = 600  # in sec
 
-    cooling_power = list(range(15000, 9999, -1000))
+    cooling_power = list(range(15000, 14000, -1000))
 
     fan_hs.set_target_rpm(15000)
     fan_cs.set_target_rpm(15000)
@@ -192,6 +250,7 @@ def tec_control():
             "GPW\n"]
 
     for i in range (min_A, max_A+1, step_size):
+        shared.set_i(i)
         print(f"Heating Current: {i/100} A")
         command_strom_set = f"SCU {i}\n"
 
@@ -199,6 +258,7 @@ def tec_control():
             resp = tec_module.ascii_communication_protocol(port, receiver_id, cmd)
             if isinstance(resp, tuple) and len(resp) >= 2 and not resp[1]:
                 break
+
         tec_module.ascii_communication_protocol(port, receiver_id, command_strom_set)
 
         stationary = False
@@ -209,7 +269,7 @@ def tec_control():
             
             last_seen = ver
             
-            if check_for_stationary(vals, std_tol = 0.2, span_tol = 0.2):
+            if check_for_stationary(vals, std_tol = 0.1, span_tol = 0.1):
                 stationary = True
         
         measurement_interval_sec = 5
@@ -235,74 +295,95 @@ def tec_control():
 
     start = False
 
+
+# ---------------- LOGGING THREAD ------------------------
+
 def logging():
     global values
+    global start  # FIX
+
     try:
         while start:
             try:
+                # --- TEC READINGS ---
+                current = parse_tec_response(
+                    tec_module.ascii_communication_protocol(port, receiver_id, "GCU\n"),
+                    "current"
+                )
 
-                # --- RTD ---
-                current = tec_module.ascii_communication_protocol(port, receiver_id, "GCU\n")
-                current = current[0]
-                current = float(current.split('=')[1].split()[0])
+                voltage_plus = parse_tec_response(
+                    tec_module.ascii_communication_protocol(port, receiver_id, "GV1\n"),
+                    "voltage_plus"
+                )
 
-                voltage_plus = tec_module.ascii_communication_protocol(port, receiver_id, "GV1\n")
-                voltage_plus = voltage_plus[0]
-                voltage_plus = float(voltage_plus.split('=')[1].split()[0])
+                voltage_minus = parse_tec_response(
+                    tec_module.ascii_communication_protocol(port, receiver_id, "GV2\n"),
+                    "voltage_minus"
+                )
 
-                voltage_minus = tec_module.ascii_communication_protocol(port, receiver_id, "GV2\n")
-                voltage_minus = voltage_minus[0]
-                voltage_minus = float(voltage_minus.split('=')[1].split()[0])
+                if current is None or voltage_plus is None or voltage_minus is None:
+                    print("Invalid TEC response detected. Skipping this logging cycle.")
+                    time.sleep(RETRY_WAIT_SECONDS)
+                    continue
 
                 rpm_fan_hs = fan_hs.get_current_rpm()
                 rpm_fan_cs = fan_cs.get_current_rpm()
 
-                print(f"Current: {current}, Voltage Heating: {voltage_plus}, \n Voltage Cooling: {voltage_minus} RPM Hot Side: {rpm_fan_hs}, RPM Cold Side: {rpm_fan_cs}")
+                set_current = shared.get_i()/100
+
+                set_rpm_hs = fan_hs.get_target_rpm()
+                set_rpm_cs = fan_cs.get_target_rpm() 
+
+                print(f"Current: {current}, V+: {voltage_plus}, V-: {voltage_minus}, "
+                      f"RPM HS: {rpm_fan_hs}, RPM CS: {rpm_fan_cs}")
 
                 timestamp = datetime.now(timezone.utc)
 
+                # --- RTD SENSORS ---
                 system_values = rtd_reader_system.read()
-                control_values = rtd_reader_control.read()
+                #control_values = rtd_reader_control.read()
+
                 rtd_writer_system.write(timestamp, system_values)
-                rtd_writer_control.write(timestamp, control_values)
-                #electrial_logger.write(timestamp, current)
-                #electrical_logger.write(timestamp, voltage)
-                #fan_logger.write(timestamp, rpm_fan_hs)
-                #fan_logger.write(timestamp, rpm_fan_cs)
+                #rtd_writer_control.write(timestamp, control_values)
+
+                # --- EXPERIMENTAL LOGGING ---
+                sensor_data_writer.write_tec(timestamp, "tec_module_kühner", set_current, current, voltage_plus, voltage_minus)
+                sensor_data_writer.write_rpm(timestamp, "fan_hs ", set_rpm_hs, rpm_fan_hs)
+                sensor_data_writer.write_rpm(timestamp, "fan_cs ", set_rpm_cs, rpm_fan_cs)
+
                 print(f"Temperature logged: {timestamp}")
-                
-                col = np.asarray(system_values, dtype=float)[:, None] 
+
+                # --- STATIONARY CHECK BUFFER ---
+                col = np.asarray(system_values, dtype=float)[:, None]
 
                 if values is None:
                     values = col
                 else:
                     values = np.hstack([values, col])
 
-                if values.shape[1] > 3:
+                # limit number of columns to 3
+                min_n = shared.get_min_n()
+                if values.shape[1] > min_n:
                     values = values[:, 1:]
 
-                #print (f"Values {values}")
-
-                shared.publish(values)
+                mask = np.all((values >= -40) & (values <= 200), axis=1)
+                filtered = values[mask]
+                shared.publish(filtered)
+                print(filtered)
 
                 time.sleep(measurement_interval_sec)
 
-            except KeyboardInterrupt:
-                print("Logging stopped by user.")
-                break
             except Exception as e:
-                print("Error occured:")
-                traceback.print_exc()
-                print(f"Restarting in {RETRY_WAIT_SECONDS} seconds...\n")
-                time.sleep(RETRY_WAIT_SECONDS)
+                break
+
     finally:
         pass
 
-    
 
 # ----------------- START THREADS -------------------------
 
 try:
+    start = True
     tec_control_thread = threading.Thread(target = tec_control)
     logging_thread = threading.Thread(target = logging)
 
@@ -321,7 +402,8 @@ finally:
     rtd_writer_control.close()
     fan_hs.cleanup()
     fan_cs.cleanup()
-    tec_module.ascii_communication_protocol(port, receiver_id, "SCU 0 \n")
+    tec_control_thread.join()
+    logging_thread.join()
+    tec_module.ascii_communication_protocol(port, receiver_id, "SCU 0\n")
+    time.sleep(1)
     GPIO.cleanup()
-
-

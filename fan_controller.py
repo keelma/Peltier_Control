@@ -1,92 +1,128 @@
 import pigpio
-import RPi.GPIO as GPIO
 import time
 from simple_pid import PID
 from threading import Lock, Thread
 
-GPIO.setmode(GPIO.BCM)
-
-class FanController:
-    def __init__(self, name, pwm_pin, pulse_rpm_pin, target_rpm = 8000, frequency = 25000, pulses_per_rev = 2, Kp = 3, Ki = 19.2157, Kd = 0.0, update_interval=1.0): # 1 10 0.0
+class Tachometer:
+    """
+    High-resolution tachometer measurement using pigpio timestamps.
+    Measures time between rising edges and converts to RPM using:
+        RPM = (1 / period) / pulses_per_rev * 60
+    """
+    def __init__(self, pi, pin, pulses_per_rev=2, glitch_us=100):
         """
-        Initializes the FanController class with the specified GPIO pin.
+        Parameters
+        ----------
+        pi : pigpio.pi()
+            The pigpio instance.
+        pin : int
+            GPIO pin for tachometer input.
+        pulses_per_rev : int
+            Number of tach pulses per mechanical revolution.
+        glitch_us : int
+            Glitch filter duration in microseconds to remove noise.
         """
-        self.pulse_rpm_pin = pulse_rpm_pin
-        self.pwm_pin = pwm_pin
-        self.rpm_count = 0
-        self.start_time = time.time()
-        self.pulse_rpm = 0
-        self.frequency = frequency
+        self.pi = pi
+        self.pin = pin
         self.pulses_per_rev = pulses_per_rev
 
+        self.last_tick = None
+        self.period = None  # seconds between pulses
+
+        self.pi.set_mode(self.pin, pigpio.INPUT)
+        self.pi.set_pull_up_down(self.pin, pigpio.PUD_UP)
+        self.pi.set_glitch_filter(self.pin, glitch_us)
+
+        self.cb = self.pi.callback(self.pin, pigpio.RISING_EDGE, self._callback)
+
+    def _callback(self, gpio, level, tick):
+        if self.last_tick is not None:
+            dt_us = pigpio.tickDiff(self.last_tick, tick)  # microseconds
+            if dt_us > 0:
+                self.period = dt_us / 1e6  # convert to seconds
+        self.last_tick = tick
+
+    def read_rpm(self):
+        if self.period is None:
+            return 0.0
+        return (1.0 / self.period) / self.pulses_per_rev * 60.0
+
+
+class FanController:
+    """
+    Fan controller with hardware PWM and high-resolution tachometer feedback.
+    Uses pigpio for both PWM and RPM measurement (no RPi.GPIO).
+    """
+    def __init__(self,
+                 name,
+                 pwm_pin,
+                 pulse_rpm_pin,
+                 target_rpm=8000,
+                 frequency=25000,
+                 pulses_per_rev=2,
+                 Kp=1.0,
+                 Ki=7.0,
+                 Kd=0.0,
+                 update_interval=0.5):
+        """
+        Parameters
+        ----------
+        name : str
+            Identifier for the fan.
+        pwm_pin : int
+            GPIO pin for hardware PWM.
+        pulse_rpm_pin : int
+            Tachometer pin.
+        target_rpm : float
+            Desired RPM setpoint.
+        frequency : int
+            PWM carrier frequency (25 kHz for PC fans).
+        pulses_per_rev : int
+            Tach pulses per revolution (almost always 2).
+        Kp, Ki, Kd : float
+            PID gains.
+        update_interval : float
+            Control loop interval in seconds.
+        """
         self.name = name
+        self.pwm_pin = pwm_pin
         self.target_rpm = target_rpm
-        self.Kp = Kp
-        self.Kd = Kd
-        self.Ki = Ki
+        self.frequency = frequency
         self.update_interval = update_interval
+
+        self.pulses_per_rev = pulses_per_rev
 
         self.lock = Lock()
         self.running = False
 
-        self.pid = PID(Kp=self.Kp, Ki=self.Ki, Kd=self.Kd, setpoint=self.target_rpm)
-        self.pid.output_limits = (300000, 1000000)
-
-        # ----- pigpio PWM on GPIO 12 -----
+        # pigpio instance
         self.pi = pigpio.pi()
         if not self.pi.connected:
             raise RuntimeError("pigpiod is not running")
 
-        # Start 25 kHz at 100 % duty via hardware PWM
+        # Tachometer (high-resolution timestamp-based)
+        self.tach = Tachometer(self.pi, pulse_rpm_pin, pulses_per_rev)
+
+        # PID setup
+        self.pid = PID(Kp=Kp, Ki=Ki, Kd=Kd, setpoint=target_rpm)
+        self.pid.output_limits = (300000, 1000000)  # avoid windup
+        self.pid.sample_time = update_interval
+
+        # Initialize fan at mid duty
         self.pi.hardware_PWM(self.pwm_pin, self.frequency, 500000)
 
-        # ----- RPi.GPIO for pulse counting -----
-        GPIO.setup(self.pulse_rpm_pin, GPIO.IN)
-
-        # Register RPi.GPIO interrupt (just like your original code)
-        GPIO.add_event_detect(self.pulse_rpm_pin, GPIO.RISING, callback=self.count_pulses, bouncetime = 1)
-
-    def count_pulses(self, channel):
-        """Count pulses from ESC (RPi.GPIO callback)."""
-        self.rpm_count += 1
-
-    def calculate_pulse_rpm(self):
-        """Calculate RPM based on counted pulses."""    
-
-        dt = time.time() - self.start_time
-        #print(dt)
-        current_count = self.rpm_count
-        self.rpm_count = 0
-        self.start_time = time.time()
-        if dt > 0:
-            self.pulse_rpm = (current_count / self.pulses_per_rev) / dt * 60.0
-        else:
-            self.pulse_rpm = 0
-
-        #print(self.pulse_rpm)
-        return self.pulse_rpm
-
-    def cleanup(self):
-        """Cleanup PWM and GPIO."""
-        GPIO.remove_event_detect(self.pulse_rpm_pin)
-        self.pi.hardware_PWM(self.pwm_pin, self.frequency, 0)
-        self.pi.stop()
-        self.running = False
-        if self.thread:
-            self.thread.join()
-        print("Cleaned up")
-
     def _set_pwm(self, value):
-        self.pi.hardware_PWM(self.pwm_pin, self.frequency, value)
+        self.pi.hardware_PWM(self.pwm_pin, self.frequency, int(value))
 
     def _control_loop(self):
         while self.running:
-            with self.lock:
-                current_rpm = self.calculate_pulse_rpm()
-            pwm = self.pid(current_rpm)
-            #print(pwm)
-            self._set_pwm(int(pwm))
-            print(f"[Fan {self.name}] Target: {self.target_rpm} RPM | Measured: {current_rpm:.1f} | PWM: {pwm:.2f}")
+            rpm = self.tach.read_rpm()
+
+            pwm = int(self.pid(rpm))
+            self._set_pwm(pwm)
+
+            print(f"[Fan {self.name}] Target: {self.target_rpm} RPM | Measured: {rpm:.1f} | PWM: {pwm}")
+
             time.sleep(self.update_interval)
 
     def start(self):
@@ -97,41 +133,43 @@ class FanController:
 
     def set_target_rpm(self, rpm):
         self.target_rpm = rpm
-        self.pid.setpoint = self.target_rpm
+        self.pid.setpoint = rpm
+
+    def get_target_rpm(self):
+        return self.target_rpm
 
     def get_current_rpm(self):
-        with self.lock:
-            return self.pulse_rpm
+        return self.tach.read_rpm()
+
+    def cleanup(self):
+        self.running = False
+        time.sleep(self.update_interval * 2)
+        self._set_pwm(0)
+        self.pi.stop()
+        print("Cleaned up fan controller.")
         
-    def set_update_interval(self, interval):
-        self.update_interval = interval
-
-    
-
 
 if __name__ == "__main__":
-    # Example pins: adjust for your wiring
-    tacho_pin_1 = 25   # Tachometer input pin
-    pwm_pin_1 = 19     # Hardware PWM pin
+    pwm_pin = 13
+    tach_pin = 16
 
-    tacho_pin_2 = 16 #16
-    pwm_pin_2 = 13
-
-    fan = FanController(name="HS_Fan", pwm_pin=pwm_pin_1, pulse_rpm_pin=tacho_pin_1, target_rpm = 15000, Kp = 0.9657, Ki = 9.2395, Kd = 0.3968)
+    fan = FanController(
+        name="HS_Fan",
+        pwm_pin=pwm_pin,
+        pulse_rpm_pin=tach_pin,
+        target_rpm=15000,
+        Kp=0.9657,
+        Ki=9.2395,
+        Kd=0.3968,
+        update_interval=0.5
+    )
     fan.start()
-
-    #fan_2 = FanController(name="CS_FAN", pwm_pin = pwm_pin_2,pulse_rpm_pin=tacho_pin_2, target_rpm=15000, Kp = 3, Ki = 19.2157, Kd = 0.0)
-    #fan_2.start()
 
     try:
         while True:
-            time.sleep(30)
-            fan.set_target_rpm(7000)
-            #fan_2.set_target_rpm(7000)
+            time.sleep(5)
             #print(f"Current RPM: {fan.get_current_rpm():.0f}")
     except KeyboardInterrupt:
         pass
     finally:
         fan.cleanup()
-        #fan_2.cleanup()
-        GPIO.cleanup()
