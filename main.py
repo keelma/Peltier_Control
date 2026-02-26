@@ -16,8 +16,30 @@ from TECModule import TECModule
 
 import re
 
-start = True
+#Logging the measurement protocol
 
+import os
+import csv
+file_path = "measurement_protocol.csv"
+
+file_exists = os.path.isfile(file_path)
+
+if not file_exists:
+    with open(file_path, mode="w", newline="", encoding = "utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["start_time", "end_time", "set_urrent", "set_rpm", "start_time_stat", "end_time_stat"])
+
+start = True
+stop_requested = False   # NEW
+
+
+
+print(f"Start Time: {datetime.now(timezone.utc)}")
+start_time = datetime.now(timezone.utc)
+
+with open(file_path, mode="a", newline="", encoding = "utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow([start_time, None, None, None, None, None])
 
 # ------------------- InfluxDB SETTINGS -------------------
 
@@ -53,7 +75,7 @@ board_3 = {
 values = None
 
 system_labels = [f"B{i}_CH{j}" for i in range(3) for j in range(1, 9)]  # 24 labels
-control_labels = ["sensor_left_front","sensor_right_front","sensor_left_back","sensor_right_back"]  # 4 labels
+control_labels = ["sensor_left_front","sensor_right_front","sensor_left_back","sensor_right_back"]
 
 rtd_reader_system = TemperatureSensorReaderRTD(board_channel_map=boards_0_2)
 rtd_reader_control = TemperatureSensorReaderRTD(board_channel_map=board_3)
@@ -65,7 +87,6 @@ rtd_writer_system = TemperatureSensorWriterRTD(
     bucket=INFLUX_BUCKET,
     sensor_type="system_id",
     labels=system_labels,
-    # csv_file_path=CSV_RTD_SYSTEM_PATH
 )
 
 rtd_writer_control = TemperatureSensorWriterRTD(
@@ -75,7 +96,6 @@ rtd_writer_control = TemperatureSensorWriterRTD(
     bucket=INFLUX_BUCKET,
     sensor_type="control",
     labels=control_labels,
-    # csv_file_path=CSV_RTD_CONTROL_PATH
 )
 
 sensor_data_writer = SensorDataWriter(
@@ -85,22 +105,22 @@ sensor_data_writer = SensorDataWriter(
     bucket=INFLUX_BUCKET,
     sensor_type="system_id",
     labels=system_labels,
-    # csv_file_path=CSV_RTD_SYSTEM_PATH
 )
 
 
 # ------------------ FAN CONFIG ---------------------------
 
 tacho_hs = 25
-pwm_hs =  12
+pwm_hs = 12
 
 tacho_cs = 16
 pwm_cs = 13
 
-fan_hs = FanController(name="fan_hs", pwm_pin = pwm_hs, pulse_rpm_pin = tacho_hs, target_rpm = 15000, Kp = 3, Kd = 0.0, Ki = 19)
-fan_cs = FanController(name = "fan_cs", pwm_pin = pwm_cs, pulse_rpm_pin = tacho_cs, target_rpm = 15000, Kp = 2.5,Ki = 11.67, Kd = 0.4)
+fan_hs = FanController(name="fan_hs", pwm_pin=pwm_hs, pulse_rpm_pin=tacho_hs, target_rpm=15000, Kp=2, Kd=0.0, Ki=14)
+fan_cs = FanController(name="fan_cs", pwm_pin=pwm_cs, pulse_rpm_pin=tacho_cs, target_rpm=15000, Kp=2.5, Ki=14, Kd=0.0)
 fan_hs.start()
 fan_cs.start()
+
 
 # --------------- TEC MODULE CONFIG -----------------------
 
@@ -108,7 +128,6 @@ port = "/dev/ttyUSB0"
 receiver_id = 10
 
 tec_module = TECModule(port, receiver_id)
-
 command_spannung = "GV1\n"
 command_strom = "GCU\n"
 command_10 = "SCU 0\n"
@@ -123,7 +142,7 @@ class Shared():
         self._values = None
         self._version = 0
         self.current_i = 0.0
-        self.min_n = 20
+        self.min_n = 120
 
     def set_i(self, val):
         with self._cond:
@@ -140,9 +159,13 @@ class Shared():
             self._version += 1
             self._cond.notify_all()
 
-    def wait_for_new(self, last_seen, timeout = None):
+    def wait_for_new(self, last_seen, timeout=None):
         with self._cond:
-            if not self._cond.wait_for(lambda: self._version != last_seen, timeout = timeout):
+            if stop_requested:   # NEW
+                return last_seen, None
+            if not self._cond.wait_for(lambda: self._version != last_seen or stop_requested, timeout=timeout):
+                return last_seen, None
+            if stop_requested:
                 return last_seen, None
             return self._version, self._values
             
@@ -152,21 +175,20 @@ class Shared():
 shared = Shared()
 
 
-def check_for_stationary(values, std_tol = 0.1, span_tol = 0.1, min_n = 5):
-
+def check_for_stationary(values, std_tol=0.1, span_tol=0.1):
     min_n = shared.get_min_n()
 
     if values is None or values.shape[1] < min_n:
-        print("BINGERBONGER")
+        print("Not enough measurements")
         return False
 
     mask = np.all((values >= -40) & (values <= 200), axis=1)
     filtered = values[mask]
 
-    row_std = np.std(filtered, axis = 1)
-    row_span = np.ptp(filtered, axis = 1)
+    row_std = np.std(filtered, axis=1)
+    row_span = np.ptp(filtered, axis=1)
 
-    print ("I am Checking")
+    print("I am Checking")
     if np.all((row_std <= std_tol) | (row_span <= span_tol)):
         print("Stationary")
         return True
@@ -175,17 +197,7 @@ def check_for_stationary(values, std_tol = 0.1, span_tol = 0.1, min_n = 5):
         return False
 
 
-# ---------------------------------------------------------------------
-# FIX: parse_tec_response rewritten but ALL prints preserved
-# ---------------------------------------------------------------------
-
 def parse_tec_response(resp, label):
-    """
-    Extracts the numeric value from the TEC ASCII response.
-    Expected format: "KEY=VALUE UNIT"
-    Returns float or None if invalid.
-    """
-
     if not isinstance(resp, tuple) or len(resp) < 2:
         print(f"Invalid TEC response structure for {label}: {resp}")
         return None
@@ -211,47 +223,65 @@ def parse_tec_response(resp, label):
 # ---------------- TEC CONTROL THREAD --------------------
 
 def tec_control():
-
     global measurement_interval_sec
-    global start  # FIX
+    global start
 
     last_seen = 0
     stationary = False
 
-    while not stationary:
+    while not stationary and not stop_requested:
         ver, vals = shared.wait_for_new(last_seen, timeout=20)
+        if stop_requested:
+            return
         if vals is None:
             continue
-        
         last_seen = ver
-        
-        if check_for_stationary(vals, std_tol = 0.1, span_tol = 0.1):
+
+        if check_for_stationary(vals):
             stationary = True
+
+    if stop_requested:
+        return
 
     # Starting ramp test
 
-    min_A = 40
-    max_A = 100
-    step_size = 20
-    step_duration = 600  # in sec
+    min_A = 100
+    max_A = 202
+    step_size = 100
+    step_duration = 600
 
-    cooling_power = list(range(15000, 14000, -1000))
+    cooling_power = list(range(15000, 9999, -5000))
 
     fan_hs.set_target_rpm(15000)
     fan_cs.set_target_rpm(15000)
 
-    tec_module.ascii_communication_protocol(port, receiver_id, f"SHC {max_A+1}\n")
-    time.sleep(1)
-    tec_module.ascii_communication_protocol(port, receiver_id, f"SCC {max_A+1}\n")
-    time.sleep(1)
+    if max_A < 0:
+        print("COOLING")
+        i = max_A*(-1)
+        tec_module.ascii_communication_protocol(port, receiver_id, f"SHC {i-1}\n")
+        time.sleep(1)
+        tec_module.ascii_communication_protocol(port, receiver_id, f"SCC {i-1}\n")
+        time.sleep(1)
 
-    ramp_commands = [command_spannung,
-            command_strom,
-            "GPW\n"]
+    else:
+        print("HEATING")
+        tec_module.ascii_communication_protocol(port, receiver_id, f"SHC {max_A+1}\n")
+        time.sleep(1)
+        tec_module.ascii_communication_protocol(port, receiver_id, f"SCC {max_A+1}\n")
+        time.sleep(1)
 
-    for i in range (min_A, max_A+1, step_size):
-        shared.set_i(i)
-        print(f"Heating Current: {i/100} A")
+
+    ramp_commands = [command_spannung, command_strom, "GPW\n"]
+
+    for i in range(min_A, max_A+1, step_size):
+        print("--------------------stop requested ?------------------------")
+        if stop_requested:
+            return
+        print("--------------------stop not requested------------------------")
+
+        shared.set_i(i)        
+    
+        print(f"----------Heating Current: {i/100} A----------")
         command_strom_set = f"SCU {i}\n"
 
         for cmd in ramp_commands:
@@ -262,34 +292,62 @@ def tec_control():
         tec_module.ascii_communication_protocol(port, receiver_id, command_strom_set)
 
         stationary = False
-        while not stationary:
-            ver, vals = shared.wait_for_new(last_seen, timeout=20)
-            if vals is None:
-                continue
-            
-            last_seen = ver
-            
-            if check_for_stationary(vals, std_tol = 0.1, span_tol = 0.1):
-                stationary = True
+        # while not stationary and not stop_requested:
+        #     ver, vals = shared.wait_for_new(last_seen, timeout=20)
+        #     if stop_requested:
+        #         return
+        #     if vals is None:
+        #         continue
+        #     last_seen = ver
+        #     if check_for_stationary(vals):
+        #         stationary = True
         
+        # if stop_requested:
+        #     return
+
         measurement_interval_sec = 5
 
         for rpm in cooling_power:
-            fan_hs.set_target_rpm(rpm)
-            fan_cs.set_target_rpm(rpm)
-            print (f"Target rpm: {rpm}")
+            if stop_requested:
+                return
 
+            # stationary = False
+            # while not stationary and not stop_requested:
+            #     ver, vals = shared.wait_for_new(last_seen, timeout=20)
+            #     if stop_requested:
+            #         return
+            #     if vals is None:
+            #         continue
+            #     last_seen = ver
+            #     if check_for_stationary(vals):
+            #         stationary = True
+            #         print("Stationary")
+
+            #fan_hs.set_target_rpm(rpm)
+            fan_cs.set_target_rpm(rpm)
+            print(f"Target rpm: {rpm}")
+            time.sleep(800)
             stationary = False
-            while not stationary:
+            while not stationary and not stop_requested:
                 ver, vals = shared.wait_for_new(last_seen, timeout=20)
+                if stop_requested:
+                    return
                 if vals is None:
                     continue
-                
                 last_seen = ver
-                
                 if check_for_stationary(vals):
                     stationary = True
+
+            if stop_requested:
+                return
+            
+            start_time_stat = datetime.now(timezone.utc)
             time.sleep(step_duration)
+            end_time_stat = datetime.now(timezone.utc)
+
+            with open(file_path, mode="a", newline="", encoding = "utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([None, None, shared.get_i()/100, rpm, start_time_stat, end_time_stat])
 
         measurement_interval_sec = 10
 
@@ -300,12 +358,11 @@ def tec_control():
 
 def logging():
     global values
-    global start  # FIX
+    global start
 
     try:
-        while start:
+        while start and not stop_requested:
             try:
-                # --- TEC READINGS ---
                 current = parse_tec_response(
                     tec_module.ascii_communication_protocol(port, receiver_id, "GCU\n"),
                     "current"
@@ -329,31 +386,27 @@ def logging():
                 rpm_fan_hs = fan_hs.get_current_rpm()
                 rpm_fan_cs = fan_cs.get_current_rpm()
 
-                set_current = shared.get_i()/100
+                set_current = shared.get_i() / 100
 
                 set_rpm_hs = fan_hs.get_target_rpm()
-                set_rpm_cs = fan_cs.get_target_rpm() 
+                set_rpm_cs = fan_cs.get_target_rpm()
 
                 print(f"Current: {current}, V+: {voltage_plus}, V-: {voltage_minus}, "
                       f"RPM HS: {rpm_fan_hs}, RPM CS: {rpm_fan_cs}")
 
                 timestamp = datetime.now(timezone.utc)
 
-                # --- RTD SENSORS ---
                 system_values = rtd_reader_system.read()
-                #control_values = rtd_reader_control.read()
 
                 rtd_writer_system.write(timestamp, system_values)
-                #rtd_writer_control.write(timestamp, control_values)
 
-                # --- EXPERIMENTAL LOGGING ---
-                sensor_data_writer.write_tec(timestamp, "tec_module_kühner", set_current, current, voltage_plus, voltage_minus)
-                sensor_data_writer.write_rpm(timestamp, "fan_hs ", set_rpm_hs, rpm_fan_hs)
-                sensor_data_writer.write_rpm(timestamp, "fan_cs ", set_rpm_cs, rpm_fan_cs)
+                sensor_data_writer.write_tec(timestamp, "tec_module_kühner",
+                                             set_current, current, voltage_plus, voltage_minus)
+                sensor_data_writer.write_rpm(timestamp, "fan_hs", set_rpm_hs, rpm_fan_hs)
+                sensor_data_writer.write_rpm(timestamp, "fan_cs", set_rpm_cs, rpm_fan_cs)
 
                 print(f"Temperature logged: {timestamp}")
 
-                # --- STATIONARY CHECK BUFFER ---
                 col = np.asarray(system_values, dtype=float)[:, None]
 
                 if values is None:
@@ -361,7 +414,6 @@ def logging():
                 else:
                     values = np.hstack([values, col])
 
-                # limit number of columns to 3
                 min_n = shared.get_min_n()
                 if values.shape[1] > min_n:
                     values = values[:, 1:]
@@ -369,9 +421,13 @@ def logging():
                 mask = np.all((values >= -40) & (values <= 200), axis=1)
                 filtered = values[mask]
                 shared.publish(filtered)
-                print(filtered)
 
-                time.sleep(measurement_interval_sec)
+                #print(filtered)
+
+                for _ in range(measurement_interval_sec):
+                    if stop_requested:
+                        return
+                    time.sleep(1)
 
             except Exception as e:
                 break
@@ -384,8 +440,8 @@ def logging():
 
 try:
     start = True
-    tec_control_thread = threading.Thread(target = tec_control)
-    logging_thread = threading.Thread(target = logging)
+    tec_control_thread = threading.Thread(target=tec_control)
+    logging_thread = threading.Thread(target=logging)
 
     tec_control_thread.start()
     logging_thread.start()
@@ -394,16 +450,21 @@ try:
     logging_thread.join()
 
 except KeyboardInterrupt:
-    print("Keyboard Interrupt.")
-    pass
+    stop_requested = True
+    with shared._cond:
+        shared._cond.notify_all()
 
 finally:
+    tec_module.ascii_communication_protocol(port, receiver_id, "SCU 0\n")
     rtd_writer_system.close()
     rtd_writer_control.close()
+    print(f"End Time: {datetime.now(timezone.utc)}")
+    end_time = datetime.now(timezone.utc)
+    with open(file_path, mode="a", newline="", encoding = "utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([None, end_time, None, None, None, None])
     fan_hs.cleanup()
     fan_cs.cleanup()
-    tec_control_thread.join()
-    logging_thread.join()
-    tec_module.ascii_communication_protocol(port, receiver_id, "SCU 0\n")
     time.sleep(1)
     GPIO.cleanup()
+    

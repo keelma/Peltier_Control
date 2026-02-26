@@ -60,9 +60,9 @@ class FanController:
                  target_rpm=8000,
                  frequency=25000,
                  pulses_per_rev=2,
-                 Kp=1.0,
-                 Ki=7.0,
-                 Kd=0.0,
+                Kp=3,
+                Kd=1,
+                Ki=12,
                  update_interval=0.5):
         """
         Parameters
@@ -121,7 +121,7 @@ class FanController:
             pwm = int(self.pid(rpm))
             self._set_pwm(pwm)
 
-            print(f"[Fan {self.name}] Target: {self.target_rpm} RPM | Measured: {rpm:.1f} | PWM: {pwm}")
+            #print(f"[Fan {self.name}] Target: {self.target_rpm} RPM | Measured: {rpm:.1f} | PWM: {pwm}")
 
             time.sleep(self.update_interval)
 
@@ -150,24 +150,23 @@ class FanController:
         
 
 if __name__ == "__main__":
-    pwm_pin = 13
-    tach_pin = 16
+    pwm_pin = 12
+    tach_pin = 25
 
     fan = FanController(
         name="HS_Fan",
         pwm_pin=pwm_pin,
         pulse_rpm_pin=tach_pin,
         target_rpm=15000,
-        Kp=0.9657,
-        Ki=9.2395,
-        Kd=0.3968,
+        Kp=2, Ki=16, Kd=0.9,
         update_interval=0.5
     )
     fan.start()
 
     try:
         while True:
-            time.sleep(5)
+            time.sleep(30)
+            fan.set_target_rpm(10000)
             #print(f"Current RPM: {fan.get_current_rpm():.0f}")
     except KeyboardInterrupt:
         pass

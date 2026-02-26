@@ -54,7 +54,7 @@ class FanPIDTuner:
     def __init__(self, fan: FanController,
                  settle_time=8.0,
                  sample_interval=0.5,
-                 target_rpm=15000):
+                 target_rpm=10000):
 
         self.fan = fan
         self.settle_time = settle_time
@@ -117,35 +117,48 @@ class FanPIDTuner:
 
     def evaluate_pid(self, Kp, Ki, Kd):
         """
-        Bayesian optimizer calls this. Returns performance score.
-        LOWER score = better.
+        Evaluate PID performance at multiple RPM setpoints.
+        Returns combined optimization score.
         """
 
-        # Apply PID
+        # Test RPM points
+        test_targets = [15000, 10000]       # modify as needed
+        weights =      [0.6,   0.4]         # prioritize high or low RPM
+
+        combined_score = 0.0
+
+        # Apply PID once
         self.fan.pid.tunings = (Kp, Ki, Kd)
 
-        # Run step response
-        t, y = self.run_step()
+        for target, w in zip(test_targets, weights):
 
-        # Compute metrics
-        error = np.abs(self.target_rpm - y)
-        iae = np.sum(error) * self.sample_interval
+            # Change tuning target
+            self.target_rpm = target
+            self.fan.set_target_rpm(target)
 
-        overshoot = max(0, np.max(y) - self.target_rpm)
-        rise = self.rise_time(t, y, self.target_rpm)
-        mid = self.mid_slope(t, y, self.target_rpm)
-        under = self.undershoot(y, self.target_rpm)
+            # Step response
+            t, y = self.run_step()
 
-        # Multi-term objective
-        score = (
-            iae * 1.0 +
-            overshoot * 0.3 -
-            mid * 0.1 +       # faster slope is good
-            rise * 0.1 +
-            under * 0.2
-        )
+            # Metrics
+            error = np.abs(target - y)
+            iae = np.sum(error) * self.sample_interval
+            overshoot = max(0, np.max(y) - target)
+            rise = self.rise_time(t, y, target)
+            mid = self.mid_slope(t, y, target)
+            under = self.undershoot(y, target)
 
-        return -score  # Bayesian Optimizer maximizes → invert
+            score = (
+                iae * 1.0 +
+                overshoot * 0.3 -
+                mid * 0.1 +
+                rise * 0.1 +
+                under * 0.2
+            )
+
+            combined_score += w * score
+
+        return -combined_score
+
 
     def tune(self):
         """
@@ -185,8 +198,8 @@ class FanPIDTuner:
 if __name__ == "__main__":
     GPIO.setmode(GPIO.BCM)
 
-    fan1 = FanController("HS_Fan", pwm_pin=12, pulse_rpm_pin=25, target_rpm=15000)
-    fan2 = FanController("CS_FAN", pwm_pin=13, pulse_rpm_pin=16, target_rpm=15000)
+    fan1 = FanController("HS_Fan", pwm_pin=12, pulse_rpm_pin=25, target_rpm=10000)
+    fan2 = FanController("CS_FAN", pwm_pin=13, pulse_rpm_pin=16, target_rpm=10000)
 
     fan1.start()
     fan2.start()
