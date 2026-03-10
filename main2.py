@@ -91,13 +91,13 @@ import pigpio
 pwm_pin_hs = 12
 pwm_pin_cs = 13
 
-tacho_pin_hs = 1
+tacho_pin_hs = 25
 tacho_pin_cs = 6
 
-fan_hs = FanController("fan_hs", tacho_pin_hs, pwm_pin_hs, 0, pulses_per_rev=2,
-                 Kp=0.00003, Ki=0.0002, Kd=0.000001, update_interval=1)
+fan_hs = FanController("fan_hs", pwm_pin_hs, tacho_pin_hs,  0, pulses_per_rev=2,
+                 Kp=0.00003, Ki=0.072, Kd=0.000001, update_interval=1)
 
-fan_cs = FanController("fan_cs", tacho_pin_cs, pwm_pin_cs, 0, pulses_per_rev = 2,
+fan_cs = FanController("fan_cs", pwm_pin_cs, tacho_pin_cs, 0, pulses_per_rev = 2,
                 Kp=0.00003, Ki=0.0002, Kd=0.000001, update_interval=1)
 
 fan_hs.start()
@@ -131,7 +131,8 @@ shared = Shared()
 
 def arm():
     global armed
-    fan_hs.set_target_rpm(14000)
+    fan_hs._set_pwm(1_000_000)
+    # fan_hs.set_target_rpm(5000)
     fan_cs.set_target_rpm(14000)
     print("Armed")
     armed = True
@@ -139,7 +140,7 @@ def arm():
 
 def disarm():
     global armed
-    fan_hs.set_target_rpm(0)
+    fan_hs.set_target_rpm(400)
     fan_cs.set_target_rpm(0)
     tec_module.ascii_communication_protocol(port, receiver_id, command_10)
     print("Disarmed")
@@ -192,8 +193,8 @@ def tec_control():
         # Starting ramp test
 
         min_A = 50
-        max_A = 50
-        step_size = 30
+        max_A = 200
+        step_size = 50
         step_duration =  600 # in sec
 
         cooling_power = list(range(100, 49, -10))
@@ -211,7 +212,7 @@ def tec_control():
             print(f"Heating Current: {i/100} A")
             command_strom_set = f"SCU {i}\n"
 
-            fan_hs.set_target_rpm(14000)
+            fan_hs._set_pwm(1_000_000)
             fan_cs.set_target_rpm(14000)
 
             for cmd in ramp_commands:
@@ -234,7 +235,8 @@ def tec_control():
             measurement_interval_sec = 5
 
             for duty in cooling_power:
-                fan_hs.set_target_rpm(duty)
+                #fan_hs.set_target_rpm(duty)
+                fan_hs._set_pwm(1_000_000)
                 fan_cs.set_target_rpm(duty)
                 print (f"Fan power: {duty}")
 

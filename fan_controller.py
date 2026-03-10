@@ -22,7 +22,11 @@ class Tachometer:
         glitch_us : int
             Glitch filter duration in microseconds to remove noise.
         """
+
+
         self.pi = pi
+
+
         self.pin = pin
         self.pulses_per_rev = pulses_per_rev
 
@@ -153,11 +157,17 @@ if __name__ == "__main__":
     pwm_pin = 12
     tach_pin = 25
 
+    pwm_pin_hs = 12
+    pwm_pin_cs = 13
+
+    tacho_pin_hs = 25
+    tacho_pin_cs = 6
+
     fan = FanController(
         name="HS_Fan",
         pwm_pin=pwm_pin,
         pulse_rpm_pin=tach_pin,
-        target_rpm=15000,
+        target_rpm=2500,
         Kp=2, Ki=16, Kd=0.9,
         update_interval=0.5
     )
@@ -166,7 +176,7 @@ if __name__ == "__main__":
     try:
         while True:
             time.sleep(30)
-            fan.set_target_rpm(10000)
+            fan.set_target_rpm(400)
             #print(f"Current RPM: {fan.get_current_rpm():.0f}")
     except KeyboardInterrupt:
         pass

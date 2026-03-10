@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import traceback
 import threading
 import numpy as np
-import RPi.GPIO as GPIO
+#import RPi.GPIO as GPIO
 
 from fan_controller import FanController
 
@@ -110,11 +110,11 @@ sensor_data_writer = SensorDataWriter(
 
 # ------------------ FAN CONFIG ---------------------------
 
-tacho_hs = 25
 pwm_hs = 12
-
-tacho_cs = 16
 pwm_cs = 13
+
+tacho_hs = 25
+tacho_cs = 6
 
 fan_hs = FanController(name="fan_hs", pwm_pin=pwm_hs, pulse_rpm_pin=tacho_hs, target_rpm=15000, Kp=2, Kd=0.0, Ki=14)
 fan_cs = FanController(name="fan_cs", pwm_pin=pwm_cs, pulse_rpm_pin=tacho_cs, target_rpm=15000, Kp=2.5, Ki=14, Kd=0.0)
@@ -142,7 +142,7 @@ class Shared():
         self._values = None
         self._version = 0
         self.current_i = 0.0
-        self.min_n = 120
+        self.min_n = 60
 
     def set_i(self, val):
         with self._cond:
@@ -246,13 +246,13 @@ def tec_control():
     # Starting ramp test
 
     min_A = 100
-    max_A = 202
-    step_size = 100
+    max_A = 301
+    step_size = 50
     step_duration = 600
 
     cooling_power = list(range(15000, 9999, -5000))
 
-    fan_hs.set_target_rpm(15000)
+    fan_hs.set_target_rpm(2400)
     fan_cs.set_target_rpm(15000)
 
     if max_A < 0:
@@ -324,6 +324,7 @@ def tec_control():
             #         print("Stationary")
 
             #fan_hs.set_target_rpm(rpm)
+            fan_hs._set_pwm(1_000_000)
             fan_cs.set_target_rpm(rpm)
             print(f"Target rpm: {rpm}")
             time.sleep(800)
@@ -397,6 +398,7 @@ def logging():
                 timestamp = datetime.now(timezone.utc)
 
                 system_values = rtd_reader_system.read()
+                print(f"system_values: {system_values}")
 
                 rtd_writer_system.write(timestamp, system_values)
 
@@ -466,5 +468,5 @@ finally:
     fan_hs.cleanup()
     fan_cs.cleanup()
     time.sleep(1)
-    GPIO.cleanup()
+    #GPIO.cleanup()
     
